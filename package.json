@@ -1,0 +1,25 @@
+{
+  "name": "@mostajs/multitenancy",
+  "version": "0.1.0",
+  "description": "Tenant context + AsyncLocalStorage scoping for multi-tenant @mostajs/* apps. Express/Next/Fastify middleware pour extraire le tenantId par requête. Composable avec @mostajs/repository (withTenantScope).",
+  "author": "Dr Hamid MADANI <drmdh@msn.com>",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
