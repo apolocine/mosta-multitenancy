@@ -1,0 +1,83 @@
+# @mostajs/multitenancy — fiche LLM
+> Contexte tenant + scoping AsyncLocalStorage pour apps SaaS multi-tenant : propagation automatique du tenantId, resolvers et middlewares HTTP.
+
+- Version: 0.1.0 · Licence: AGPL-3.0-or-later · Auteur: Dr Hamid MADANI <drmdh@msn.com>
+- Chemin: mostajs/mosta-multitenancy · Statut audit: complet (dist/)
+
+## RÔLE
+Module d'isolation multi-tenant de l'écosystème mostajs. Pose le `tenantId` une seule fois au début d'un handler HTTP et le propage à toute la pile async (tous les `await`) via `AsyncLocalStorage` de Node.js — sans jamais le passer en argument. Résout le tenant depuis une requête HTTP (par header, sous-domaine ou path), fournit des middlewares Express et un wrapper Fetch standard (Next.js App Router, Hono, Bun, Deno), et applique une politique d'accès (allow/deny/validation). Composable avec `@mostajs/repository.withTenantScope` pour filtrer automatiquement les queries DB et éviter les fuites de données inter-tenant.
+
+## INSTALLATION
+npm i @mostajs/multitenancy
+
+## EXPORTS
+Point d'entrée unique (`.`) — pas de sous-chemins :
+- Contexte: getCurrentTenantId, getCurrentTenant, runWithTenant, runWithoutTenant, requireTenant
+- Resolvers: tenantFromHeader, tenantFromSubdomain, tenantFromPath, combineResolvers
+- Middlewares: expressTenantMiddleware, withTenant
+- Policy: checkTenantPolicy
+- Types: TenantInfo, TenantResolver, TenantPolicy
+
+## API — SIGNATURES
+getCurrentTenantId(): string | null  // null si hors d'un run
+getCurrentTenant(): TenantInfo | null
+runWithTenant<T>(tenant: TenantInfo, fn: () => Promise<T>|T): Promise<T>  // exécute fn dans un contexte tenant
+runWithoutTenant<T>(fn: () => Promise<T>|T): Promise<T>  // détache (null) pour opérations cross-tenant admin
+requireTenant(): TenantInfo  // throw si pas de tenant
+tenantFromHeader(headerName?: string): TenantResolver  // typique API B2B
+tenantFromSubdomain(opts?: { rootDomain? }): TenantResolver  // acme.example.com → acme
+tenantFromPath(opts?: { prefix? }): TenantResolver  // /t/:tenantSlug/...
+combineResolvers(...resolvers: TenantResolver[]): TenantResolver  // premier match gagne
+expressTenantMiddleware(opts: { resolver, onMissing?:'reject'|'allow'|callback }): (req,res,next)=>void
+withTenant<T>(req: Request, opts:{ resolver, onMissing?:'reject'|'allow' }, fn:()=>Promise<T>): Promise<T|Response>
+checkTenantPolicy(tenant: TenantInfo, policy?: TenantPolicy): Promise<boolean>
+
+## TYPES CLÉS
+TenantInfo { id, name?, slug?, userId?:string|null, metadata?:Record<string,unknown> }
+TenantResolver = (req: Request | { headers, url }) => Promise<TenantInfo|null> | TenantInfo | null
+TenantPolicy { allowedIds?:string[], blockedIds?:string[](priorité), validate?:(tenant)=>Promise<boolean>|boolean }
+
+## PATTERN
+```ts
+// Next.js App Router — wrapper Fetch standard
+import { withTenant, tenantFromHeader, getCurrentTenantId } from '@mostajs/multitenancy'
+export async function GET(req: Request) {
+  return withTenant(req, { resolver: tenantFromHeader() }, async () => {
+    const tid = getCurrentTenantId()   // valeur correcte partout dans la pile async
+    return Response.json(await listForTenant())
+  })
+}
+
+// Express
+import { expressTenantMiddleware, tenantFromSubdomain } from '@mostajs/multitenancy'
+app.use(expressTenantMiddleware({ resolver: tenantFromSubdomain({ rootDomain:'example.com' }), onMissing:'reject' }))
+
+// Service tenant-scoped
+import { requireTenant } from '@mostajs/multitenancy'
+function listInvoices() {
+  const tenant = requireTenant()   // throw si appelé hors contexte tenant
+  return db.find({ tenantId: tenant.id })
+}
+
+// Opération admin cross-tenant (à utiliser avec prudence)
+import { runWithoutTenant } from '@mostajs/multitenancy'
+await runWithoutTenant(() => migrateAllTenants())
+```
+
+## DÉPEND DE
+- Aucun module @mostajs/* requis (seuls @types/node + typescript en devDependencies).
+- Composable (optionnel) avec @mostajs/repository.withTenantScope — branché par le consumer, jamais importé en dur.
+
+## PIÈGES
+- getCurrentTenantId / getCurrentTenant renvoient null si appelés hors d'un runWithTenant / withTenant / expressTenantMiddleware — le contexte ne « fuit » pas en dehors de la callback.
+- Toute logique tenant-scoped doit s'exécuter À L'INTÉRIEUR de la callback de runWithTenant/withTenant : un `await` lancé puis résolu hors du run perd le contexte.
+- requireTenant lève une exception si aucun tenant : le placer en tête d'un service pour fail-fast plutôt que produire une query sans filtre.
+- runWithoutTenant désactive l'isolation (tenant = null) : réservé aux opérations admin cross-tenant ; un mauvais usage expose les données de tous les tenants.
+- withTenant peut retourner soit le résultat de fn, soit une `Response` (401) si onMissing='reject' et aucun tenant détecté — typer le retour en `T | Response`.
+- checkTenantPolicy : blockedIds est prioritaire sur allowedIds ; si allowedIds est défini, tout id absent est refusé.
+- Version 0.1.0 — module récent ; un seul point d'entrée, pas d'API stable garantie hors de ce qui est listé.
+
+## RÉFÉRENCES
+- README.md (racine du module) — quick start, stratégies de résolution, patterns avancés, troubleshooting
+- docs/ (racine du module)
+- LICENSE (AGPL-3.0-or-later)
