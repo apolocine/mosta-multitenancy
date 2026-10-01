@@ -80,6 +80,28 @@ Note : `AsyncLocalStorage` est natif Node ≥ 16, zero dep, sûr en concurrent (
 
 ## 3. Quick start — how to use
 
+### 0.2 — recommandé : le client d'après l'hôte, en `node:http`, et le refus de l'inconnu
+
+```js
+import http from 'node:http'
+import { tenantFromHost, nodeTenantHandler, getCurrentTenantId } from '@mostajs/multitenancy'
+
+const resoudre = tenantFromHost({
+  domains: 'amia.fr,mostajs.dev',          // labo.amia.fr et labo.mostajs.dev : deux clients distincts
+  reserved: ['www', 'admin', 'console'],   // l'infrastructure n'est jamais un client
+  header: { name: 'x-site', trusted: (req) => req.headers['x-relais'] === process.env.RELAIS_SECRET },
+})
+
+http.createServer(nodeTenantHandler(resoudre, async (req, res) => {
+  res.end(`client : ${getCurrentTenantId()}`)   // jamais null ici : l'inconnu a reçu 404 avant
+})).listen(3000)
+```
+
+Ce que la 0.2 corrige par rapport à la logique d'origine (TicketFlow v0.3, en production) : **aucun
+client par défaut** (un hôte qui ne désigne personne est refusé, au lieu de servir un site
+« default » — incident du 15/09/2026), et l'en-tête de site n'est écouté **que d'un appelant de
+confiance**. `tenantFromHeader` et `tenantFromSubdomain` restent pour compatibilité, déconseillés.
+
 ### Installation
 
 ```bash

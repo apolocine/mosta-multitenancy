@@ -63,7 +63,10 @@ export function requireTenant(): TenantInfo {
 export type TenantResolver = (req: Request | { headers: any; url: string }) =>
   Promise<TenantInfo | null> | TenantInfo | null
 
-/** Resolver : par header HTTP (typique pour API B2B). */
+/** Resolver : par header HTTP (typique pour API B2B).
+ *  @deprecated 0.2 — l'en-tête est accepté de N'IMPORTE QUEL appelant : n'importe qui choisit son
+ *  client. Préférer `tenantFromHost({ header: { name, trusted } })`, qui ne l'écoute que d'un
+ *  appelant de confiance. */
 export function tenantFromHeader(headerName = 'x-tenant-id'): TenantResolver {
   return (req: any) => {
     const h = req.headers?.get
@@ -74,7 +77,10 @@ export function tenantFromHeader(headerName = 'x-tenant-id'): TenantResolver {
   }
 }
 
-/** Resolver : par sous-domaine (`acme.example.com` → `acme`). */
+/** Resolver : par sous-domaine (`acme.example.com` → `acme`).
+ *  @deprecated 0.2 — un seul domaine, aucun nom réservé hors `www`, et un hôte qui ne correspond pas
+ *  au domaine donne quand même une clé (son premier label) au lieu d'être refusé. Préférer
+ *  `tenantFromHost`. */
 export function tenantFromSubdomain(opts?: { rootDomain?: string }): TenantResolver {
   const rootRe = opts?.rootDomain
     ? new RegExp(`\\.${opts.rootDomain.replace(/\./g, '\\.')}$`)
@@ -179,3 +185,101 @@ export async function checkTenantPolicy(tenant: TenantInfo, policy?: TenantPolic
   if (policy.validate) return await Promise.resolve(policy.validate(tenant))
   return true
 }
+
+// ─── 0.2 — LE CLIENT D'APRÈS L'HÔTE, ou le REFUS (01/10/2026) ──────────────────────────────────
+//
+// Logique reprise de TicketFlow v0.3 (`lib/tenant.ts`, en production), sans ses deux défauts :
+//   - l'en-tête de site y était accepté de TOUT appelant, et prioritaire sur l'hôte ;
+//   - un hôte hors des domaines retombait sur un site « default » — la classe de l'incident du
+//     15/09/2026, où des sites mal déclarés affichaient la configuration d'un autre.
+// Ici, un hôte qui ne désigne pas un client connu est REFUSÉ (null). Il n'existe pas de client par
+// défaut : c'est à l'application de dire ce qu'elle sert hors client (sa vitrine, sa console).
+
+/** Options de `tenantFromHost` / `tenantKeyFromHost`. */
+export interface HostTenantOptions {
+  /** Domaines de base : tableau, ou liste séparée par des virgules (`amia.fr,mostajs.dev`). */
+  domains: string | string[]
+  /** Préfixes réservés à l'infrastructure (`www`, `admin`, `console`…) : jamais un client. */
+  reserved?: string[]
+  /** `host` (défaut) : `labo.amia.fr` ≠ `labo.mostajs.dev`. `prefix` : `labo`. */
+  key?: 'host' | 'prefix'
+  /** En-tête désignant le client — écouté SEULEMENT si `trusted(req)` est vrai (relais, console). */
+  header?: { name: string; trusted: (req: any) => boolean }
+}
+
+const LABEL = '[a-z0-9](?:[a-z0-9-]*[a-z0-9])?'
+const NOM = new RegExp(`^${LABEL}(?:\\.${LABEL})*$`)
+
+const listeDomaines = (d: string | string[]): string[] =>
+  (Array.isArray(d) ? d : String(d || '').split(','))
+    .map((x) => x.trim().toLowerCase().replace(/\.$/, '')).filter(Boolean)
+
+const enTete = (req: any, nom: string): string => {
+  const h = req?.headers
+  if (!h) return ''
+  if (typeof h.get === 'function') return String(h.get(nom) ?? '')
+  const v = h[nom.toLowerCase()] ?? h[nom]
+  return String(Array.isArray(v) ? v[0] : v ?? '')
+}
+
+/** L'hôte d'une requête (node:http ou Fetch) : minuscules, sans port, sans point final. */
+export function hostOf(req: any): string {
+  let h = enTete(req, 'host')
+  if (!h && typeof req?.url === 'string' && /^https?:\/\//i.test(req.url)) {
+    try { h = new URL(req.url).host } catch { h = '' }
+  }
+  return h.trim().toLowerCase().replace(/:\d+$/, '').replace(/\.$/, '')
+}
+
+/** La clé du client désigné par `host`, ou `null` — jamais une valeur par défaut. */
+export function tenantKeyFromHost(host: string, opts: HostTenantOptions): string | null {
+  const h = String(host || '').trim().toLowerCase().replace(/:\d+$/, '').replace(/\.$/, '')
+  if (!h || !NOM.test(h)) return null
+  const reserves = (opts.reserved || []).map((r) => r.toLowerCase())
+  for (const base of listeDomaines(opts.domains)) {
+    if (h === base || !h.endsWith(`.${base}`)) continue
+    const prefixe = h.slice(0, h.length - base.length - 1)
+    if (!prefixe || reserves.includes(prefixe)) return null
+    return opts.key === 'prefix' ? prefixe : h
+  }
+  return null
+}
+
+/**
+ * Résolveur : le client d'après l'hôte — ou d'après l'en-tête, si l'appelant est de confiance.
+ * Rend `{ id, slug, metadata: { host, via } }`, ou `null` (refus).
+ */
+export function tenantFromHost(opts: HostTenantOptions): TenantResolver {
+  return (req: any) => {
+    if (opts.header && opts.header.trusted(req)) {
+      const v = enTete(req, opts.header.name).trim().toLowerCase()
+      if (v) return NOM.test(v) ? { id: v, slug: v.split('.')[0], metadata: { host: v, via: 'header' } } : null
+    }
+    const host = hostOf(req)
+    const id = tenantKeyFromHost(host, opts)
+    if (!id) return null
+    return { id, slug: tenantKeyFromHost(host, { ...opts, key: 'prefix' }) ?? id, metadata: { host, via: 'host' } }
+  }
+}
+
+/**
+ * Adaptateur `node:http` : exécute `handler` dans le contexte du client résolu ; un client inconnu
+ * reçoit **404** (pas 401 : ce n'est pas une affaire d'identité, l'adresse ne désigne rien).
+ */
+export function nodeTenantHandler(
+  resolver: TenantResolver,
+  handler: (req: any, res: any) => unknown,
+  opts: { onUnknown?: (req: any, res: any) => void } = {},
+): (req: any, res: any) => Promise<void> {
+  return async (req, res) => {
+    const tenant = await Promise.resolve(resolver(req))
+    if (!tenant) {
+      if (opts.onUnknown) return void opts.onUnknown(req, res)
+      res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' })
+      res.end(`${JSON.stringify({ ok: false, code: 'TENANT_UNKNOWN', error: 'aucun client ne correspond à cette adresse' })}\n`)
+      return
+    }
+    await _als.run(tenant, () => Promise.resolve(handler(req, res)))
+  }
+}
+

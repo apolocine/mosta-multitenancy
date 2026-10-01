@@ -1,11 +1,25 @@
 # @mostajs/multitenancy — fiche LLM
 > Contexte tenant + scoping AsyncLocalStorage pour apps SaaS multi-tenant : propagation automatique du tenantId, resolvers et middlewares HTTP.
 
-- Version: 0.1.0 · Licence: AGPL-3.0-or-later · Auteur: Dr Hamid MADANI <drmdh@msn.com>
+- Version: 0.2.0 · Licence: AGPL-3.0-or-later · Auteur: Dr Hamid MADANI <drmdh@msn.com>
 - Chemin: mostajs/mosta-multitenancy · Statut audit: complet (dist/)
 
 ## RÔLE
 Module d'isolation multi-tenant de l'écosystème mostajs. Pose le `tenantId` une seule fois au début d'un handler HTTP et le propage à toute la pile async (tous les `await`) via `AsyncLocalStorage` de Node.js — sans jamais le passer en argument. Résout le tenant depuis une requête HTTP (par header, sous-domaine ou path), fournit des middlewares Express et un wrapper Fetch standard (Next.js App Router, Hono, Bun, Deno), et applique une politique d'accès (allow/deny/validation). Composable avec `@mostajs/repository.withTenantScope` pour filtrer automatiquement les queries DB et éviter les fuites de données inter-tenant.
+
+## 0.2 — LE CLIENT D'APRÈS L'HÔTE, OU LE REFUS (01/10/2026)
+Logique reprise de TicketFlow v0.3 (`lib/tenant.ts`, en production), sans ses deux défauts.
+- tenantFromHost({ domains, reserved?, key?: 'host'|'prefix', header?: { name, trusted(req) } }) → TenantResolver
+    domains : tableau ou « a.fr,b.dev ». Clé par défaut = HÔTE COMPLET (labo.amia.fr ≠ labo.mostajs.dev).
+    Rend { id, slug, metadata: { host, via: 'host'|'header' } } — ou **null** : hôte hors domaines, domaine nu,
+    préfixe réservé, hôte mal formé. **Il n'existe pas de client par défaut.**
+    header : écouté SEULEMENT si trusted(req) est vrai (relais, console) ; sinon ignoré.
+- tenantKeyFromHost(host, opts) → string | null   (pur, sans requête)
+- hostOf(req) → string   (node:http ou Fetch ; minuscules, sans port, sans point final)
+- nodeTenantHandler(resolver, handler, { onUnknown? }) → (req, res) => Promise<void>
+    client inconnu → **404** JSON `TENANT_UNKNOWN` (pas 401 : l'adresse ne désigne rien) ; sinon `handler`
+    s'exécute dans le contexte (getCurrentTenantId() vaut la clé dans toute la chaîne async).
+Essais : test-scripts/multitenancy.test.mjs (T-MT-1 à 8, mjs-unit).
 
 ## INSTALLATION
 npm i @mostajs/multitenancy
@@ -13,8 +27,9 @@ npm i @mostajs/multitenancy
 ## EXPORTS
 Point d'entrée unique (`.`) — pas de sous-chemins :
 - Contexte: getCurrentTenantId, getCurrentTenant, runWithTenant, runWithoutTenant, requireTenant
-- Resolvers: tenantFromHeader, tenantFromSubdomain, tenantFromPath, combineResolvers
-- Middlewares: expressTenantMiddleware, withTenant
+- Resolvers: **tenantFromHost** (0.2, recommandé), tenantKeyFromHost, hostOf, tenantFromPath, combineResolvers ;
+  tenantFromHeader et tenantFromSubdomain sont DÉCONSEILLÉS (voir PIÈGES)
+- Middlewares: **nodeTenantHandler** (0.2, node:http), expressTenantMiddleware, withTenant
 - Policy: checkTenantPolicy
 - Types: TenantInfo, TenantResolver, TenantPolicy
 
@@ -69,6 +84,11 @@ await runWithoutTenant(() => migrateAllTenants())
 - Composable (optionnel) avec @mostajs/repository.withTenantScope — branché par le consumer, jamais importé en dur.
 
 ## PIÈGES
+- 0.2 : `tenantFromHeader` accepte l'en-tête de N'IMPORTE QUEL appelant — n'importe qui choisit son client.
+  `tenantFromSubdomain` donne une clé même à un hôte hors domaine (son premier label) au lieu de le refuser.
+  Les deux restent pour compatibilité ; utiliser `tenantFromHost`.
+- Ne jamais retomber sur un client « par défaut » quand la résolution échoue (incident TicketFlow du 15/09/2026 :
+  des sites mal déclarés affichaient la configuration d'un autre). Un `null` se traite par un refus.
 - getCurrentTenantId / getCurrentTenant renvoient null si appelés hors d'un runWithTenant / withTenant / expressTenantMiddleware — le contexte ne « fuit » pas en dehors de la callback.
 - Toute logique tenant-scoped doit s'exécuter À L'INTÉRIEUR de la callback de runWithTenant/withTenant : un `await` lancé puis résolu hors du run perd le contexte.
 - requireTenant lève une exception si aucun tenant : le placer en tête d'un service pour fail-fast plutôt que produire une query sans filtre.
